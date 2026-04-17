@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.git/
+.gitignore
+README.md
+assets/*.png
+/tmp/
