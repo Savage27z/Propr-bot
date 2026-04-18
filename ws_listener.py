@@ -46,6 +46,23 @@ _LIVE_PNL_DIFF_FRACTION = Decimal("0.01")  # 1% of notional
 # Last push per positionId: (timestamp_utc, last_unrealized_pnl).
 _last_pushed_pnl: Dict[str, Tuple[datetime, Decimal]] = {}
 
+# Per-order fill-event waiters. Populated by :func:`wait_for_fill` and
+# resolved inside :func:`_handle_message` when a matching event arrives.
+# Keyed by the server-assigned ``orderId`` of the entry order; the future's
+# result is the raw event payload dict.
+_FILL_WAITERS: Dict[str, "asyncio.Future[Dict[str, Any]]"] = {}
+_WAITER_LOCK = asyncio.Lock()
+
+# Events that indicate an entry order is now live enough for conditional
+# legs to attach. ``order.triggered`` is included because some venues emit
+# it before the canonical ``order.filled`` on limit fills.
+_FILL_RESOLVING_EVENTS = frozenset({
+    "order.filled",
+    "order.partially_filled",
+    "order.triggered",
+    "position.opened",
+})
+
 # Event-name → emoji + template. Keys are lower-cased, punctuation-normalized.
 _EVENT_TEMPLATES: Dict[str, str] = {
     "order.filled": "✅ Filled: {side} {qty} {asset} @ {price}",
@@ -266,6 +283,85 @@ async def _maybe_push_live_pnl(
         log.error("Failed to send live PnL update: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Fill-event waiter registry — used by the deferred-bracket fallback to place
+# SL/TP only after the entry has actually filled, dodging the 13056
+# ``conditional_order_requires_position_or_group`` race.
+# ---------------------------------------------------------------------------
+async def wait_for_fill(
+    order_id: str, timeout: float = 90.0
+) -> Optional[Dict[str, Any]]:
+    """Resolve when a matching ``order.filled`` event arrives for *order_id*.
+
+    Returns the event payload dict, or ``None`` on timeout. The caller is
+    expected to schedule placement of dependent orders (SL/TP) in the
+    resolving callback. Registration is idempotent — only one waiter per
+    order id; concurrent callers share the same future.
+
+    Also resolves on ``order.partially_filled``, ``order.triggered`` and
+    ``position.opened`` so venue-specific event ordering doesn't block us.
+    """
+    loop = asyncio.get_event_loop()
+    async with _WAITER_LOCK:
+        fut = _FILL_WAITERS.get(order_id)
+        if fut is None:
+            fut = loop.create_future()
+            _FILL_WAITERS[order_id] = fut
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        async with _WAITER_LOCK:
+            # Only clear if this is still the future we registered — a
+            # reconnect could have raced and replaced it.
+            if _FILL_WAITERS.get(order_id) is fut:
+                _FILL_WAITERS.pop(order_id, None)
+
+
+def _payload_order_id(payload: Dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of an order id from an event payload.
+
+    Different event kinds nest the id differently:
+    - ``order.*`` usually has ``orderId`` at the top.
+    - ``position.opened`` may carry ``entryOrderId`` or a nested ``order``.
+    """
+    for key in ("orderId", "entryOrderId", "id"):
+        val = payload.get(key)
+        if val:
+            return str(val)
+    nested = payload.get("order")
+    if isinstance(nested, dict):
+        for key in ("orderId", "id"):
+            val = nested.get(key)
+            if val:
+                return str(val)
+    return None
+
+
+def _resolve_fill_waiter(event: str, payload: Dict[str, Any]) -> None:
+    """Resolve any waiter registered for this event's order id.
+
+    Runs BEFORE the Telegram-message formatting in :func:`_handle_message`
+    so that a crash in message rendering can't leave the bracket-placement
+    task hanging — the worst case is we set the future and the message
+    fails to send.
+    """
+    if event not in _FILL_RESOLVING_EVENTS:
+        return
+    order_id = _payload_order_id(payload)
+    if not order_id:
+        return
+    fut = _FILL_WAITERS.get(order_id)
+    if fut is None or fut.done():
+        return
+    try:
+        fut.set_result(payload)
+    except asyncio.InvalidStateError:
+        # Future was completed or cancelled by another resolver.
+        pass
+
+
 async def _handle_message(app: Any, chat_id: int, raw: Any) -> None:
     """Parse a single websocket frame and dispatch to Telegram if relevant."""
     bot = app.bot
@@ -292,6 +388,15 @@ async def _handle_message(app: Any, chat_id: int, raw: Any) -> None:
         return
 
     payload = _extract_payload(msg)
+
+    # Resolve any bracket-placement waiter BEFORE the Telegram send so a
+    # message-formatting crash cannot leave the deferred SL/TP task hanging.
+    # The waiter registry is populated by handlers placing limit entries
+    # that need to wait for a fill before attaching conditional legs.
+    try:
+        _resolve_fill_waiter(event, payload)
+    except Exception as exc:  # noqa: BLE001 — never let a waiter bug crash ws
+        log.debug("fill waiter resolver error: %s", exc)
 
     # Live PnL stream — only position.updated, and only when the toggle is on.
     if event == "position.updated":

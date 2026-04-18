@@ -284,6 +284,67 @@ class ProprClient:
             "PUT", f"/accounts/{account_id}/margin-config/{config_id}", json=body
         )
 
+    async def place_batch(
+        self, account_id: str, orders: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Submit a batch of orders in one ``POST /accounts/{id}/orders`` request.
+
+        Atomic-batch strategy for the 13056
+        ``conditional_order_requires_position_or_group`` race: when the
+        entry and its bracket legs (SL/TP) are sent together in one call
+        the Propr server can group them against the resulting position, so
+        the conditionals never look orphaned.
+
+        Each order must already contain its business fields. This method
+        only injects the boilerplate the API requires — a fresh ULID
+        ``intentId``, ``exchange=hyperliquid``, ``productType=perp``,
+        ``accountId`` — for any order missing them. Asset is normalised for
+        HIP-3 routing and :class:`Decimal` values are stringified in place
+        so :mod:`httpx` can serialise the payload.
+
+        Returns the raw envelope so callers can iterate over ``data`` and
+        correlate legs by ``intentId``.
+        """
+        payload: List[Dict[str, Any]] = []
+        for raw in orders:
+            order: Dict[str, Any] = {
+                "accountId": raw.get("accountId", account_id),
+                "intentId": raw.get("intentId") or str(ULID()),
+                "exchange": raw.get("exchange", "hyperliquid"),
+                "productType": raw.get("productType", "perp"),
+            }
+            # Normalise asset on every leg so HIP-3 tickers route correctly
+            # and the SL/TP legs match the entry's venue symbol.
+            asset = raw.get("asset")
+            if asset:
+                a_norm = normalize_asset(asset)
+                order["asset"] = a_norm
+                order.setdefault("base", a_norm)
+                order.setdefault("quote", "USDC")
+            # Pass through everything else; stringify Decimals so
+            # ``httpx`` json serialisation doesn't lose precision.
+            for k, v in raw.items():
+                if k in order:
+                    continue
+                if v is None:
+                    continue
+                if isinstance(v, Decimal):
+                    order[k] = format(v, "f")
+                else:
+                    order[k] = v
+            order.setdefault("reduceOnly", False)
+            order.setdefault("closePosition", False)
+            payload.append(order)
+        log.debug(
+            "place_batch account=%s n=%d types=%s",
+            account_id,
+            len(payload),
+            [o.get("type") for o in payload],
+        )
+        return await self._request(
+            "POST", f"/accounts/{account_id}/orders", json={"orders": payload}
+        )
+
     async def place_order(self, **order_fields: Any) -> Dict[str, Any]:
         """Submit a single order via POST /accounts/{id}/orders.
 
@@ -555,6 +616,18 @@ class ProprClient:
 # ----------------------------------------------------------------------
 # Private helpers
 # ----------------------------------------------------------------------
+def is_conditional_requires_position(exc: ProprAPIError) -> bool:
+    """True if *exc* is the 13056 ``conditional_order_requires_position_or_group``.
+
+    The Propr API emits this 400 when an SL/TP is submitted before its
+    paired entry fills (or before the server can group them). Callers
+    branch on it to fall back from an atomic batch attempt to a deferred
+    post-fill placement.
+    """
+    body = exc.body if isinstance(exc.body, dict) else {}
+    return exc.status == 400 and body.get("code") == 13056
+
+
 def _looks_like_already_done(body: Any) -> bool:
     """Detect "order already filled/cancelled" 400 sentinels in a body dict.
 

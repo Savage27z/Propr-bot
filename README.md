@@ -146,5 +146,10 @@ Important notes:
   route to the correct venue.
 - Every order carries a fresh ULID `intentId`, generated inside
   `ProprClient.place_order` so the caller cannot forget.
+- Entries and their SL/TP brackets are placed atomically where possible
+  (single batched `POST /orders`); when the venue can't group them — e.g.
+  limit entries that fill later — the bot falls back to a deferred path
+  that attaches SL/TP on the ws `order.filled` / `position.opened` event,
+  dodging the `conditional_order_requires_position_or_group` (13056) race.
 - Pending analysis confirmations expire after 5 minutes; the keyboard is
   removed and an expiry notice is sent.

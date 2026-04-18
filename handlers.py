@@ -44,10 +44,12 @@ from propr import (
     ProprAPIError,
     ProprClient,
     asset_ticker,
+    is_conditional_requires_position,
     max_leverage_for,
     normalize_asset,
 )
 from utils import escape_md, fmt_num
+from ws_listener import wait_for_fill
 
 log = logging.getLogger(__name__)
 
@@ -976,7 +978,15 @@ async def _execute_parsed_trade(
     asset: str,
     parsed: dict,
 ) -> None:
-    """Turn a parsed Groq recommendation into live Propr orders."""
+    """Turn a parsed Groq recommendation into live Propr orders.
+
+    Delegates to :func:`_execute_open_with_brackets` so the entry+SL+TP
+    placement goes through the atomic-batch-with-deferred-fallback path
+    that dodges the 13056
+    ``conditional_order_requires_position_or_group`` race (previously
+    this function placed entry, SL, and TP sequentially — which
+    reliably tripped the race on limit entries).
+    """
     client = _get_client(context)
     try:
         account_id = await _ensure_account_id(context)
@@ -997,182 +1007,32 @@ async def _execute_parsed_trade(
     order_type: str = parsed.get("order_type") or "market"
 
     position_side = "long" if direction == "long" else "short"
-    taker_side = "buy" if position_side == "long" else "sell"
-    opposite_side = "sell" if taker_side == "buy" else "buy"
+    take_profits: List[Decimal] = [tp1] + ([tp2] if tp2 is not None else [])
 
-    # Step 1: leverage
-    if leverage is not None and leverage > 0:
-        try:
-            current_cfg = await client.get_margin_config(account_id, asset)
-            if isinstance(current_cfg, dict) and "data" in current_cfg and isinstance(current_cfg["data"], dict):
-                current_cfg = current_cfg["data"]
-            current_lev = None
-            if isinstance(current_cfg, dict):
-                current_lev = current_cfg.get("leverage")
-            try:
-                current_lev_int = int(float(current_lev)) if current_lev is not None else None
-            except (TypeError, ValueError):
-                current_lev_int = None
-            if current_lev_int != leverage:
-                await client.set_leverage(account_id, asset, leverage)
-        except Exception as exc:  # noqa: BLE001
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Execution failed at step leverage: {exc}",
-            )
-            return
+    ok, summary = await _execute_open_with_brackets(
+        bot=context.bot,
+        chat_id=chat_id,
+        bot_data=context.application.bot_data,
+        client=client,
+        account_id=account_id,
+        asset=asset,
+        side=position_side,
+        order_type=order_type,
+        quantity=quantity,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profits=take_profits,
+        leverage=leverage,
+    )
 
-    # Step 2: entry
-    # review finding 2: capture the entry orderId from the place_order envelope
-    # so that on SL failure we can cancel the unfilled limit before closing any
-    # partial fill (close_position is a no-op against a still-open limit).
-    entry_order_id: Optional[str] = None
-    try:
-        if order_type == "limit" and entry_price is not None:
-            entry_resp = await client.place_order(
-                account_id=account_id,
-                asset=asset,
-                type="limit",
-                side=taker_side,
-                positionSide=position_side,
-                timeInForce="GTC",
-                quantity=quantity,
-                price=entry_price,
-                reduceOnly=False,
-            )
-            entry_desc = f"limit @ {fmt_num(entry_price)}"
-        else:
-            entry_resp = await client.place_order(
-                account_id=account_id,
-                asset=asset,
-                type="market",
-                side=taker_side,
-                positionSide=position_side,
-                timeInForce="IOC",
-                quantity=quantity,
-                reduceOnly=False,
-            )
-            entry_desc = "market"
-        entry_order_id = _extract_order_id(entry_resp)
-    except Exception as exc:  # noqa: BLE001
+    if ok:
         await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ Execution failed at step entry: {exc}",
+            chat_id=chat_id, text=f"🚀 {summary}"
         )
-        return
-
-    # Step 3: stop loss — critical. If placement fails after a live entry,
-    # the position is naked so we attempt an immediate close (PR #1 review
-    # finding #3). A failed close means the user has an unprotected position
-    # and we surface a loud warning.
-    try:
-        await client.place_order(
-            account_id=account_id,
-            asset=asset,
-            type="stop_market",
-            side=opposite_side,
-            positionSide=position_side,
-            timeInForce="GTC",
-            quantity=quantity,
-            triggerPrice=stop_loss,
-            reduceOnly=True,
-        )
-    except Exception as sl_exc:  # noqa: BLE001
-        # review finding 2: for limit entries the order may still be open /
-        # only partially filled. Cancel the entry first so the naked limit
-        # doesn't keep living; then close any realised fill.
-        cancel_err: Optional[Exception] = None
-        if order_type == "limit" and entry_order_id:
-            try:
-                await client.cancel_order(account_id, entry_order_id)
-            except Exception as c_exc:  # noqa: BLE001
-                cancel_err = c_exc
-        try:
-            await client.close_position(account_id, asset, position_side)
-        except Exception as close_exc:  # noqa: BLE001
-            cancel_reason = (
-                f" | cancel={cancel_err}" if cancel_err else ""
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"🚨 SL placement failed AND close failed. "
-                    f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
-                    f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
-                ),
-            )
-            return
-        rollback_msg = "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ SL placement failed; position {rollback_msg}. Reason: {sl_exc}",
-        )
-        return
-
-    # Step 4: take profit(s) — non-fatal. SL is live, so a TP failure just
-    # means the user has to place TPs manually; the position is protected.
-    tp_msgs: List[str] = []
-    tp_warnings: List[str] = []
-    if tp2 is not None:
-        half_qty = _half_qty(quantity)
-        try:
-            await client.place_order(
-                account_id=account_id,
-                asset=asset,
-                type="take_profit_market",
-                side=opposite_side,
-                positionSide=position_side,
-                timeInForce="GTC",
-                quantity=half_qty,
-                triggerPrice=tp1,
-                reduceOnly=True,
-            )
-            tp_msgs.append(f"TP1: {fmt_num(tp1)}")
-        except Exception as tp_exc:  # noqa: BLE001
-            tp_warnings.append(f"⚠️ TP1 failed: {tp_exc} — SL is still active")
-        try:
-            await client.place_order(
-                account_id=account_id,
-                asset=asset,
-                type="take_profit_market",
-                side=opposite_side,
-                positionSide=position_side,
-                timeInForce="GTC",
-                quantity=quantity - half_qty,
-                triggerPrice=tp2,
-                reduceOnly=True,
-            )
-            tp_msgs.append(f"TP2: {fmt_num(tp2)}")
-        except Exception as tp_exc:  # noqa: BLE001
-            tp_warnings.append(f"⚠️ TP2 failed: {tp_exc} — SL is still active")
     else:
-        try:
-            await client.place_order(
-                account_id=account_id,
-                asset=asset,
-                type="take_profit_market",
-                side=opposite_side,
-                positionSide=position_side,
-                timeInForce="GTC",
-                quantity=quantity,
-                triggerPrice=tp1,
-                reduceOnly=True,
-            )
-            tp_msgs.append(f"TP1: {fmt_num(tp1)}")
-        except Exception as tp_exc:  # noqa: BLE001
-            tp_warnings.append(f"⚠️ TP1 failed: {tp_exc} — SL is still active")
-
-    for warning in tp_warnings:
-        await context.bot.send_message(chat_id=chat_id, text=warning)
-
-    direction_upper = direction.upper()
-    summary_parts = [
-        f"{direction_upper} {fmt_num(quantity, 6)} {asset} @ {entry_desc}",
-        f"SL: {fmt_num(stop_loss)}",
-    ]
-    summary_parts.extend(tp_msgs)
-    summary = " | ".join(summary_parts)
-    await context.bot.send_message(chat_id=chat_id, text=f"🚀 Trade executed: {summary}")
+        await context.bot.send_message(
+            chat_id=chat_id, text=f"❌ Execution failed: {summary}"
+        )
 
 
 def _half_qty(qty: Decimal) -> Decimal:
@@ -1180,6 +1040,542 @@ def _half_qty(qty: Decimal) -> Decimal:
     half = qty / Decimal(2)
     # Preserve up to 8 decimal places to handle small-lot crypto sizes.
     return half.quantize(Decimal("0.00000001"))
+
+
+# ---------------------------------------------------------------------------
+# Atomic entry + brackets helper
+#
+# Unifies the auto-exec paths in ``/analysis`` and the NL ``open`` intent so
+# both dodge the ``conditional_order_requires_position_or_group`` (13056)
+# race. Strategy: try a single batched POST first (cheap + atomic on the
+# Propr side); if the conditionals get rejected with 13056 — or we're on a
+# limit entry that fills later — fall back to placing just the entry and
+# deferring SL/TP to a background task that awaits the ws
+# ``order.filled``/``position.opened`` event.
+# ---------------------------------------------------------------------------
+_BRACKETS_WAIT_TIMEOUT = 90.0  # seconds to wait for the entry fill event
+
+
+def _build_entry_leg(
+    *,
+    account_id: str,
+    asset: str,
+    side: str,
+    taker_side: str,
+    order_type: str,
+    quantity: Decimal,
+    entry_price: Optional[Decimal],
+) -> dict:
+    """Shape the entry order for ``place_batch`` / ``place_order``."""
+    leg: dict = {
+        "accountId": account_id,
+        "asset": asset,
+        "type": order_type,
+        "side": taker_side,
+        "positionSide": side,
+        "quantity": quantity,
+        "reduceOnly": False,
+    }
+    if order_type == "limit" and entry_price is not None:
+        leg["timeInForce"] = "GTC"
+        leg["price"] = entry_price
+    else:
+        leg["timeInForce"] = "IOC"
+    return leg
+
+
+def _build_sl_leg(
+    *,
+    account_id: str,
+    asset: str,
+    side: str,
+    opposite_side: str,
+    quantity: Decimal,
+    stop_loss: Decimal,
+) -> dict:
+    return {
+        "accountId": account_id,
+        "asset": asset,
+        "type": "stop_market",
+        "side": opposite_side,
+        "positionSide": side,
+        "timeInForce": "GTC",
+        "quantity": quantity,
+        "triggerPrice": stop_loss,
+        "reduceOnly": True,
+    }
+
+
+def _build_tp_leg(
+    *,
+    account_id: str,
+    asset: str,
+    side: str,
+    opposite_side: str,
+    quantity: Decimal,
+    trigger: Decimal,
+) -> dict:
+    return {
+        "accountId": account_id,
+        "asset": asset,
+        "type": "take_profit_market",
+        "side": opposite_side,
+        "positionSide": side,
+        "timeInForce": "GTC",
+        "quantity": quantity,
+        "triggerPrice": trigger,
+        "reduceOnly": True,
+    }
+
+
+def _tp_qtys(quantity: Decimal, n_tps: int) -> List[Decimal]:
+    """Return per-leg quantities for *n_tps* take-profit orders.
+
+    One TP → full qty. Two TPs → half each, with the remainder going on TP2
+    so we never over-allocate vs. the position size.
+    """
+    if n_tps <= 1:
+        return [quantity]
+    half = _half_qty(quantity)
+    return [half, quantity - half]
+
+
+def _format_summary(
+    *,
+    direction_upper: str,
+    quantity: Decimal,
+    asset: str,
+    entry_desc: str,
+    stop_loss: Optional[Decimal],
+    take_profits: List[Decimal],
+) -> str:
+    parts = [f"{direction_upper} {fmt_num(quantity, 6)} {asset} @ {entry_desc}"]
+    if stop_loss is not None:
+        parts.append(f"SL: {fmt_num(stop_loss)}")
+    for i, tp in enumerate(take_profits, start=1):
+        parts.append(f"TP{i}: {fmt_num(tp)}")
+    return " | ".join(parts)
+
+
+async def _maybe_set_leverage(
+    client: ProprClient, account_id: str, asset: str, leverage: Optional[int]
+) -> None:
+    """Set leverage only if it differs from the current margin config.
+
+    Matches the behaviour of the pre-refactor sequential paths: avoids
+    tripping Propr's rate limits on no-op PUTs.
+    """
+    if leverage is None or leverage <= 0:
+        return
+    current_cfg = await client.get_margin_config(account_id, asset)
+    if (
+        isinstance(current_cfg, dict)
+        and "data" in current_cfg
+        and isinstance(current_cfg["data"], dict)
+    ):
+        current_cfg = current_cfg["data"]
+    current_lev: Any = None
+    if isinstance(current_cfg, dict):
+        current_lev = current_cfg.get("leverage")
+    try:
+        current_lev_int = (
+            int(float(current_lev)) if current_lev is not None else None
+        )
+    except (TypeError, ValueError):
+        current_lev_int = None
+    if current_lev_int != leverage:
+        await client.set_leverage(account_id, asset, leverage)
+
+
+async def _rollback_naked_entry(
+    *,
+    bot: Any,
+    chat_id: int,
+    client: ProprClient,
+    account_id: str,
+    asset: str,
+    side: str,
+    order_type: str,
+    entry_order_id: Optional[str],
+    trigger_exc: Exception,
+) -> str:
+    """Cancel an unfilled limit + close any realised fill, returning a summary.
+
+    Honors the ``404 == clean rollback`` rule used elsewhere: if close
+    returns 404 AND the entry was a market (or we already cancelled the
+    limit), nothing actually filled so it's a clean rollback. On any other
+    close failure we push a loud "UNPROTECTED" alert and re-raise via the
+    returned summary so the caller can decide how to escalate.
+    """
+    cancel_err: Optional[Exception] = None
+    cancelled = False
+    if order_type == "limit" and entry_order_id:
+        try:
+            await client.cancel_order(account_id, entry_order_id)
+            cancelled = True
+        except Exception as c_exc:  # noqa: BLE001
+            cancel_err = c_exc
+    closed = False
+    try:
+        await client.close_position(account_id, asset, side)
+        closed = True
+    except ProprAPIError as close_exc:
+        if close_exc.status == 404 and (cancelled or order_type == "market"):
+            # Nothing to close — entry never filled. Clean rollback.
+            pass
+        else:
+            cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚨 SL placement failed AND close failed. "
+                    f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                    f"Reasons: SL={trigger_exc} | close={close_exc}{cancel_reason}"
+                ),
+            )
+            return f"MANUAL INTERVENTION NEEDED ({trigger_exc})"
+    except Exception as close_exc:  # noqa: BLE001
+        cancel_reason = f" | cancel={cancel_err}" if cancel_err else ""
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🚨 SL placement failed AND close failed. "
+                f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
+                f"Reasons: SL={trigger_exc} | close={close_exc}{cancel_reason}"
+            ),
+        )
+        return f"MANUAL INTERVENTION NEEDED ({trigger_exc})"
+    if cancelled and not closed:
+        return "entry cancelled (nothing filled)"
+    if cancelled and closed:
+        return "cancelled + partial fill closed"
+    if closed:
+        return "closed"
+    return "no position open"
+
+
+async def _place_brackets_after_fill(
+    *,
+    bot: Any,
+    chat_id: int,
+    client: ProprClient,
+    account_id: str,
+    asset: str,
+    side: str,
+    order_type: str,
+    entry_order_id: Optional[str],
+    quantity: Decimal,
+    stop_loss: Optional[Decimal],
+    take_profits: List[Decimal],
+) -> None:
+    """Background task body: wait for the entry fill then attach SL/TP.
+
+    Runs as a ``asyncio.create_task`` from :func:`_execute_open_with_brackets`
+    so the user's confirmation message returns instantly while the brackets
+    attach asynchronously. On SL failure the existing rollback sequence
+    fires; TP failures are non-fatal (SL already protects the position).
+    """
+    if not entry_order_id:
+        log.warning(
+            "brackets task skipped: no entry_order_id for %s %s", side, asset
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ {asset} entry placed but no orderId returned — brackets "
+                "not attached. Use /sl and /tp manually."
+            ),
+        )
+        return
+
+    try:
+        fill_payload = await wait_for_fill(
+            entry_order_id, timeout=_BRACKETS_WAIT_TIMEOUT
+        )
+    except Exception as exc:  # noqa: BLE001 — ws listener not running etc.
+        # Defensive fallback: if the ws waiter blew up, sleep briefly and try
+        # placement anyway. The user still gets SL/TP, just with less
+        # determinism than the event-driven path.
+        log.warning(
+            "wait_for_fill raised, falling back to 3s sleep: %s", exc
+        )
+        await asyncio.sleep(3)
+        fill_payload = {"fallback": True}
+
+    if fill_payload is None:
+        # Timeout — the entry didn't fill within _BRACKETS_WAIT_TIMEOUT.
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⚠️ {asset} entry didn't fill within "
+                f"{int(_BRACKETS_WAIT_TIMEOUT)}s — brackets not attached. "
+                "Use /sl and /tp manually."
+            ),
+        )
+        return
+
+    opposite_side = "sell" if side == "long" else "buy"
+    # Step 1: SL — critical. If it fails, rollback the now-live entry.
+    if stop_loss is not None and stop_loss > 0:
+        try:
+            await client.stop_loss(
+                account_id, asset, quantity, stop_loss, side
+            )
+        except Exception as sl_exc:  # noqa: BLE001
+            summary = await _rollback_naked_entry(
+                bot=bot,
+                chat_id=chat_id,
+                client=client,
+                account_id=account_id,
+                asset=asset,
+                side=side,
+                order_type=order_type,
+                entry_order_id=entry_order_id,
+                trigger_exc=sl_exc,
+            )
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ SL placement failed; {summary}. Reason: {sl_exc}",
+            )
+            return
+
+    # Step 2: TP(s) — non-fatal; user keeps SL protection on any failure.
+    tp_msgs: List[str] = []
+    tp_warnings: List[str] = []
+    if take_profits:
+        qtys = _tp_qtys(quantity, len(take_profits))
+        for idx, (leg_qty, tp_trigger) in enumerate(
+            zip(qtys, take_profits), start=1
+        ):
+            try:
+                await client.take_profit(
+                    account_id, asset, leg_qty, tp_trigger, side
+                )
+                tp_msgs.append(f"TP{idx} {fmt_num(tp_trigger)}")
+            except Exception as tp_exc:  # noqa: BLE001
+                tp_warnings.append(
+                    f"⚠️ TP{idx} failed: {tp_exc} — SL is still active"
+                )
+
+    # Step 3: single follow-up message summarising what attached.
+    parts: List[str] = []
+    if stop_loss is not None:
+        parts.append(f"SL {fmt_num(stop_loss)}")
+    parts.extend(tp_msgs)
+    if parts:
+        await bot.send_message(
+            chat_id=chat_id, text="🛡 Brackets placed: " + " | ".join(parts)
+        )
+    for warning in tp_warnings:
+        await bot.send_message(chat_id=chat_id, text=warning)
+
+
+def _track_bracket_task(bot_data: dict, task: asyncio.Task) -> None:
+    """Retain a reference to *task* so it isn't GC'd mid-run."""
+    tasks: List[asyncio.Task] = bot_data.setdefault("bracket_tasks", [])
+    tasks.append(task)
+    # Drop done tasks opportunistically so the list doesn't grow unbounded.
+    bot_data["bracket_tasks"] = [t for t in tasks if not t.done()]
+
+
+async def _execute_open_with_brackets(
+    *,
+    bot: Any,
+    chat_id: int,
+    bot_data: dict,
+    client: ProprClient,
+    account_id: str,
+    asset: str,
+    side: str,
+    order_type: str,
+    quantity: Decimal,
+    entry_price: Optional[Decimal],
+    stop_loss: Optional[Decimal],
+    take_profits: List[Decimal],
+    leverage: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """Atomic entry + SL + TP placement with deferred fallback.
+
+    Strategy (dodges the 13056
+    ``conditional_order_requires_position_or_group`` race):
+
+    1. If *leverage* differs from the current config, set it.
+    2. If neither SL nor TPs are requested, place only the entry — there's
+       no conditional to race against.
+    3. Otherwise try a single batched POST (entry + SL + TP legs). The
+       Propr server groups them against the resulting position if it can,
+       which sidesteps the race entirely.
+    4. If the batch is rejected with 13056 — or the entry is a limit that
+       won't fill synchronously — fall through: place only the entry, then
+       spawn a background task that awaits the ws ``order.filled`` /
+       ``position.opened`` event before attaching SL/TP. The background
+       task owns the existing rollback sequence on SL failure.
+
+    Returns ``(ok, summary_message)``. The summary is intended for direct
+    inclusion in the user-facing confirmation. The background task (when
+    spawned) emits its own follow-up once brackets attach.
+    """
+    # Step 1: leverage.
+    if leverage is not None and leverage > 0:
+        try:
+            await _maybe_set_leverage(client, account_id, asset, leverage)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"leverage step failed: {exc}"
+
+    direction_upper = "LONG" if side == "long" else "SHORT"
+    taker_side = "buy" if side == "long" else "sell"
+    opposite_side = "sell" if taker_side == "buy" else "buy"
+    entry_desc = (
+        f"limit {fmt_num(entry_price)}"
+        if order_type == "limit" and entry_price is not None
+        else "market"
+    )
+    has_brackets = (
+        stop_loss is not None and stop_loss > 0
+    ) or bool(take_profits)
+
+    # Step 2: no brackets requested → plain entry, no race to avoid.
+    if not has_brackets:
+        try:
+            await client.place_order(
+                account_id=account_id,
+                asset=asset,
+                type=order_type,
+                side=taker_side,
+                positionSide=side,
+                timeInForce="GTC" if order_type == "limit" else "IOC",
+                quantity=quantity,
+                price=entry_price if order_type == "limit" else None,
+                reduceOnly=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, f"entry placement failed: {exc}"
+        summary = _format_summary(
+            direction_upper=direction_upper,
+            quantity=quantity,
+            asset=asset,
+            entry_desc=entry_desc,
+            stop_loss=None,
+            take_profits=[],
+        )
+        return True, summary
+
+    # Step 3: atomic batch attempt. Market entries are the happy path for
+    # this branch — the server typically groups all legs immediately.
+    # review finding 13056: single POST lets Propr attach conditionals to
+    # the resulting position atomically, dodging the race entirely.
+    legs: List[dict] = [
+        _build_entry_leg(
+            account_id=account_id,
+            asset=asset,
+            side=side,
+            taker_side=taker_side,
+            order_type=order_type,
+            quantity=quantity,
+            entry_price=entry_price,
+        )
+    ]
+    if stop_loss is not None and stop_loss > 0:
+        legs.append(
+            _build_sl_leg(
+                account_id=account_id,
+                asset=asset,
+                side=side,
+                opposite_side=opposite_side,
+                quantity=quantity,
+                stop_loss=stop_loss,
+            )
+        )
+    if take_profits:
+        qtys = _tp_qtys(quantity, len(take_profits))
+        for leg_qty, tp in zip(qtys, take_profits):
+            legs.append(
+                _build_tp_leg(
+                    account_id=account_id,
+                    asset=asset,
+                    side=side,
+                    opposite_side=opposite_side,
+                    quantity=leg_qty,
+                    trigger=tp,
+                )
+            )
+
+    # Limit entries almost always need the deferred path (the position
+    # doesn't exist yet), so skip the batch attempt for them to avoid a
+    # guaranteed 13056 round-trip.
+    try_batch = order_type != "limit"
+    batch_ok = False
+    if try_batch:
+        try:
+            await client.place_batch(account_id, legs)
+            batch_ok = True
+        except ProprAPIError as exc:
+            if is_conditional_requires_position(exc):
+                # review finding 13056: fall through to deferred brackets.
+                log.info(
+                    "batch rejected with 13056; deferring brackets for %s %s",
+                    side,
+                    asset,
+                )
+            else:
+                return False, f"batch entry failed: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"batch entry failed: {exc}"
+
+    if batch_ok:
+        summary = _format_summary(
+            direction_upper=direction_upper,
+            quantity=quantity,
+            asset=asset,
+            entry_desc=entry_desc,
+            stop_loss=stop_loss,
+            take_profits=take_profits,
+        )
+        return True, f"Order placed (atomic): {summary}"
+
+    # Step 4: deferred fallback — place entry only, then attach brackets
+    # after the ``order.filled`` / ``position.opened`` event arrives.
+    try:
+        entry_response = await client.place_order(
+            account_id=account_id,
+            asset=asset,
+            type=order_type,
+            side=taker_side,
+            positionSide=side,
+            timeInForce="GTC" if order_type == "limit" else "IOC",
+            quantity=quantity,
+            price=entry_price if order_type == "limit" else None,
+            reduceOnly=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"entry placement failed: {exc}"
+
+    entry_order_id = _extract_order_id(entry_response)
+    task = asyncio.create_task(
+        _place_brackets_after_fill(
+            bot=bot,
+            chat_id=chat_id,
+            client=client,
+            account_id=account_id,
+            asset=asset,
+            side=side,
+            order_type=order_type,
+            entry_order_id=entry_order_id,
+            quantity=quantity,
+            stop_loss=stop_loss,
+            take_profits=list(take_profits),
+        ),
+        name=f"brackets-{asset}-{entry_order_id or 'noid'}",
+    )
+    _track_bracket_task(bot_data, task)
+
+    entry_summary = (
+        f"{direction_upper} {fmt_num(quantity, 6)} {asset} @ {entry_desc}"
+    )
+    deferred = (
+        f"Entry placed: {entry_summary}. Brackets will attach when it fills."
+    )
+    return True, deferred
 
 
 # ---------------------------------------------------------------------------
@@ -1270,7 +1666,7 @@ def _render_intent_card(
             notional = usd_amount * lev_mul
             lines.append(
                 f"Size: {escape_md(qty_str)} {escape_md(asset)} "
-                f"\\(~${escape_md(fmt_num(notional))} notional, "
+                f"\\(\\~${escape_md(fmt_num(notional))} notional, "
                 f"${escape_md(fmt_num(usd_amount))} margin @ {escape_md(lev_label)}\\)"
             )
         else:
@@ -1723,7 +2119,13 @@ async def _execute_intent_open(
     chat_id: int,
     pending: "PendingIntent",
 ) -> str:
-    """Execute an ``open`` intent: optional leverage + entry + optional SL/TP."""
+    """Execute an ``open`` intent: optional leverage + entry + optional SL/TP.
+
+    Delegates to :func:`_execute_open_with_brackets` so the entry+SL+TP
+    placement goes through the atomic-batch-with-deferred-fallback path
+    that dodges the 13056
+    ``conditional_order_requires_position_or_group`` race.
+    """
     intent = pending.intent
     asset = str(intent.get("asset") or "")
     side = str(intent.get("side") or "").lower()
@@ -1741,124 +2143,29 @@ async def _execute_intent_open(
     if quantity is None or quantity <= 0:
         raise ProprAPIError(400, "open intent has no usable quantity")
 
-    taker_side = "buy" if side == "long" else "sell"
-    opposite_side = "sell" if taker_side == "buy" else "buy"
+    take_profits: List[Decimal] = (
+        [take_profit] if take_profit is not None and take_profit > 0 else []
+    )
 
-    # Leverage step — only when the user specified one. Match existing
-    # analysis-execute behavior: compare against current margin config and
-    # only PUT if it changed, so we don't trip Propr's rate limits on no-ops.
-    if leverage is not None and leverage > 0:
-        try:
-            current_cfg = await client.get_margin_config(account_id, asset)
-            if (
-                isinstance(current_cfg, dict)
-                and "data" in current_cfg
-                and isinstance(current_cfg["data"], dict)
-            ):
-                current_cfg = current_cfg["data"]
-            current_lev = None
-            if isinstance(current_cfg, dict):
-                current_lev = current_cfg.get("leverage")
-            try:
-                current_lev_int = (
-                    int(float(current_lev)) if current_lev is not None else None
-                )
-            except (TypeError, ValueError):
-                current_lev_int = None
-            if current_lev_int != leverage:
-                await client.set_leverage(account_id, asset, leverage)
-        except ProprAPIError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise ProprAPIError(0, f"leverage step failed: {exc}") from exc
-
-    # Entry step.
-    # review finding 2: record the entry orderId so a later SL failure can
-    # cancel an unfilled limit before attempting close_position.
-    entry_order_id: Optional[str] = None
-    if order_type == "limit" and limit_price is not None and limit_price > 0:
-        entry_resp = await client.place_order(
-            account_id=account_id,
-            asset=asset,
-            type="limit",
-            side=taker_side,
-            positionSide=side,
-            timeInForce="GTC",
-            quantity=quantity,
-            price=limit_price,
-            reduceOnly=False,
-        )
-        entry_desc = f"limit @ {fmt_num(limit_price)}"
-    else:
-        entry_resp = await client.place_order(
-            account_id=account_id,
-            asset=asset,
-            type="market",
-            side=taker_side,
-            positionSide=side,
-            timeInForce="IOC",
-            quantity=quantity,
-            reduceOnly=False,
-        )
-        entry_desc = "market"
-    entry_order_id = _extract_order_id(entry_resp)
-
-    # Optional SL — rollback pattern: if placement fails after a live entry,
-    # cancel any unfilled limit entry then attempt an immediate close on the
-    # filled portion (review finding 2 hardens the previous close-only path,
-    # which left unfilled limit entries live on the book).
-    extras: List[str] = []
-    if stop_loss is not None and stop_loss > 0:
-        try:
-            await client.stop_loss(account_id, asset, quantity, stop_loss, side)
-            extras.append(f"SL: {fmt_num(stop_loss)}")
-        except Exception as sl_exc:  # noqa: BLE001
-            # review finding 2: same rollback sequence as the analysis flow —
-            # cancel unfilled limit entry first, then close any fill.
-            cancel_err: Optional[Exception] = None
-            if order_type == "limit" and entry_order_id:
-                try:
-                    await client.cancel_order(account_id, entry_order_id)
-                except Exception as c_exc:  # noqa: BLE001
-                    cancel_err = c_exc
-            try:
-                await client.close_position(account_id, asset, side)
-            except Exception as close_exc:  # noqa: BLE001
-                cancel_reason = (
-                    f" | cancel={cancel_err}" if cancel_err else ""
-                )
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🚨 SL placement failed AND close failed. "
-                        f"OPEN POSITION UNPROTECTED. Manually close {asset} now. "
-                        f"Reasons: SL={sl_exc} | close={close_exc}{cancel_reason}"
-                    ),
-                )
-                raise ProprAPIError(
-                    0, f"SL failed then close failed — MANUAL INTERVENTION NEEDED ({sl_exc})"
-                ) from sl_exc
-            rollback_msg = (
-                "cancelled+closed" if entry_order_id and order_type == "limit" else "closed"
-            )
-            raise ProprAPIError(
-                0, f"SL placement failed; position {rollback_msg} ({sl_exc})"
-            ) from sl_exc
-
-    # Optional TP — non-fatal; user keeps SL protection.
-    if take_profit is not None and take_profit > 0:
-        try:
-            await client.take_profit(account_id, asset, quantity, take_profit, side)
-            extras.append(f"TP: {fmt_num(take_profit)}")
-        except Exception as tp_exc:  # noqa: BLE001
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ TP placement failed: {tp_exc} — position is still open.",
-            )
-
-    summary = f"Opened {side.upper()} {fmt_num(quantity, 6)} {asset} @ {entry_desc}"
-    if extras:
-        summary += " | " + " | ".join(extras)
+    ok, summary = await _execute_open_with_brackets(
+        bot=context.bot,
+        chat_id=chat_id,
+        bot_data=context.application.bot_data,
+        client=client,
+        account_id=account_id,
+        asset=asset,
+        side=side,
+        order_type=order_type,
+        quantity=quantity,
+        entry_price=limit_price if order_type == "limit" else None,
+        stop_loss=stop_loss,
+        take_profits=take_profits,
+        leverage=leverage,
+    )
+    if not ok:
+        # Surface as ProprAPIError so the NL callback's status line renders
+        # the failure in the same shape as every other intent kind.
+        raise ProprAPIError(0, summary)
     return summary
 
 
